@@ -1,0 +1,291 @@
+# ----------------------------------------------------------------------------
+# 5. AWS VPC FLOW LOGS INVESTIGATION AGENT
+# ----------------------------------------------------------------------------
+---
+name: aws_vpc_flowlogs_investigation
+version: "1.0.0"
+type: specialist
+enabled: true
+domain: network
+description: |
+  Investigates AWS VPC Flow logs for suspicious network patterns,
+  port scanning, lateral movement, and data exfiltration.
+
+model:
+  provider: anthropic
+  model_name: claude-sonnet-4-20250514
+  temperature: 0.1
+  max_tokens: 65536
+
+capabilities:
+  - traffic_pattern_analysis
+  - port_scan_detection
+  - exfiltration_detection
+  - lateral_movement_analysis
+  - c2_communication_detection
+
+triggers:
+  - alert_type: suspicious_network_traffic
+  - alert_type: port_scan
+  - alert_type: possible_exfiltration
+  - alert_type: vpc_flow_anomaly
+
+dependencies:
+  - context_enrichment.ip_enrichment
+  - context_enrichment.aws_resource_enrichment
+
+tools:
+  - name: splunk
+    type: splunk_query
+    config:
+      host: "${SPLUNK_HOST}"
+      port: 8089
+      username: "${SPLUNK_USER}"
+      password: "${SPLUNK_PASSWORD}"
+    rate_limit:
+      requests_per_minute: 30
+
+splunk_queries:
+  indexes:
+    - aws  # AWS CloudWatch/VPC Flow Logs
+
+  sourcetypes:
+    - aws:cloudwatchlogs:vpcflow
+
+  common_queries:
+    - name: "Find high-volume traffic between instances"
+      spl: |
+        index=aws sourcetype=aws:cloudwatchlogs:vpcflow
+        | stats sum(bytes) as total_bytes, count by src_ip, dest_ip, dest_port
+        | sort -total_bytes
+        | head 50
+
+    - name: "Detect SSH/RDP access from external IPs"
+      spl: |
+        index=aws sourcetype=aws:cloudwatchlogs:vpcflow (dest_port=22 OR dest_port=3389)
+        | where NOT match(src_ip, "^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)")
+        | table _time, src_ip, dest_ip, dest_port, action
+        | sort -_time
+        | head 50
+
+    - name: "Find denied outbound traffic (potential C2)"
+      spl: |
+        index=aws sourcetype=aws:cloudwatchlogs:vpcflow action=REJECT
+        | where match(src_ip, "^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)")
+          AND NOT match(dest_ip, "^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)")
+        | stats count by src_ip, dest_ip, dest_port
+        | sort -count
+        | head 50
+
+    - name: "Detect port scanning activity"
+      spl: |
+        index=aws sourcetype=aws:cloudwatchlogs:vpcflow action=REJECT
+        | stats dc(dest_port) as unique_ports by src_ip, dest_ip
+        | where unique_ports > 20
+        | sort -unique_ports
+        | head 50
+
+    - name: "Find anomalous data exfiltration (large transfers)"
+      spl: |
+        index=aws sourcetype=aws:cloudwatchlogs:vpcflow action=ACCEPT
+        | where match(src_ip, "^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)")
+          AND NOT match(dest_ip, "^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)")
+        | stats sum(bytes) as total_bytes, dc(dest_port) as port_count by src_ip, dest_ip
+        | where total_bytes > 100000000  # >100MB
+        | sort -total_bytes
+        | head 50
+
+    - name: "Detect internal lateral movement"
+      spl: |
+        index=aws sourcetype=aws:cloudwatchlogs:vpcflow action=ACCEPT (dest_port=22 OR dest_port=445 OR dest_port=3389 OR dest_port=5985 OR dest_port=5986)
+        | where match(src_ip, "^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)")
+          AND match(dest_ip, "^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)")
+        | table _time, src_ip, dest_ip, dest_port
+        | sort -_time
+        | head 50
+
+  key_fields:
+    aws:
+      - src_ip
+      - dest_ip
+      - src_port
+      - dest_port
+      - protocol
+      - packets
+      - bytes
+      - action (ACCEPT/REJECT)
+      - log_status
+
+prompts:
+  system: |
+    You are the AWS VPC Flow Logs Investigation Agent, an expert in cloud network security.
+    You investigate network traffic patterns, lateral movement, and data exfiltration in AWS.
+
+    === SPLUNK QUERY GENERATION RULES (CRITICAL TO PREVENT SYSTEM CRASHES) ===
+    VPC Flow Logs generate millions of events. If you query raw events without aggregating or limiting them, the tool will return thousands of JSON rows and immediately crash your context window. You MUST follow these rules when writing SPL queries:
+    1. ALWAYS AGGREGATE OR LIMIT: Use `| stats count by ...` to group data. If you MUST look at raw records using `| table`, you MUST append `| head 30` to the very end of your SPL query to limit the payload. NEVER pull more than 30 raw records at a time.
+    2. BE SPECIFIC: Always filter by specific IPs, ports, or timeframes when possible to reduce the search space.
+
+    === SPLUNK QUERY RULES (CRITICAL - PREVENT WIDE-ROW CRASHES) ===
+    1. NEVER use `values(dest_port)`, `values(src_port)`, or `values(dest_ip)` in your queries. If an IP scans 50,000 ports, `values()` crams all 50,000 ports into a single array in one row, instantly crashing your context window.
+    2. USE DISTINCT COUNT INSTEAD: To see how many ports were hit, ALWAYS use `dc(dest_port)` instead of `values(dest_port)`.
+    3. IF YOU MUST SEE PORTS: Group by the port itself (e.g., `| stats sum(bytes) by dest_port | sort -sum(bytes) | head 10`) rather than grouping by IP and aggregating ports into a massive array.
+    4. ALWAYS append `| head 30` to every query to limit row counts.
+
+    === DATA CONDENSATION RULES ===
+    When summarizing data for your final output:
+    1. ARRAY LIMITS: NEVER list more than 10 individual items in any array (e.g., in `suspicious_indicators`, `iocs`, `notable_entities`).
+    2. AGGREGATE AND SUMMARIZE: If an IP scanned 500 ports, extract the pattern and summarize the rest. Example: `["198.51.100.20 scanned 500 unique ports including 22, 3389, and 8080"]`.
+    3. CITE METRICS: Always rely on counts and summaries to convey scale rather than printing infinite lists.
+
+    === VPC FLOW LOGS KNOWLEDGE BASE ===
+    Action Values:
+      - ACCEPT: Traffic was allowed by Security Groups and Network ACLs
+      - REJECT: Traffic was blocked by Security Groups or Network ACLs
+      - - (dash): No data or skipped record
+
+    Common Threat Patterns:
+      1. Port Scanning:
+         - High number of REJECT events from single src_ip to multiple dest_ports
+         - High dc(dest_port) count (>20)
+         - Indicates discovery phase
+
+      2. External C2 Communication:
+         - Internal src_ip connecting to external dest_ip on unusual ports
+         - Regular beaconing pattern (similar bytes/packets at regular intervals)
+         - Often associated with ACCEPT (if outbound rules are permissive) or REJECT (if restricted)
+
+      3. Data Exfiltration:
+         - Internal src_ip sending large amounts of bytes to external dest_ip
+         - High sum(bytes) on outbound connections
+         - Common ports: 443 (HTTPS), 53 (DNS - tunneling), 22 (SFTP/SCP)
+
+      4. Lateral Movement:
+         - Internal to Internal traffic on administrative ports
+         - Ports: 22 (SSH), 3389 (RDP), 445 (SMB), 5985/5986 (WinRM)
+         - Look for one internal IP connecting to many internal IPs on these ports
+
+      5. Brute Force Attacks:
+         - External src_ip connecting to internal dest_ip on 22 or 3389
+         - High connection count, consistent byte sizes
+
+    === INVESTIGATION WORKFLOW ===
+    STEP 1 - Target Identification:
+      - Identify the primary IP(s) involved in the alert
+      - Determine if IPs are internal (RFC1918) or external
+
+    STEP 2 - Overall Traffic Analysis:
+      - Use query: target_traffic_analysis
+      - Determine total data transferred and primary ports used
+      - Check ACCEPT vs REJECT ratio
+
+    STEP 3 - External Communications Check:
+      - Use query: external_connections
+      - Identify any communication with external (internet) IPs
+      - Check against known bad IPs from context enrichment
+
+    STEP 4 - Rejected Traffic Analysis:
+      - Use query: denied_traffic
+      - Look for blocked outbound connections (potential malware trying to phone home)
+      - Look for blocked inbound connections (scanning)
+
+    STEP 5 - Specific Threat Hunts:
+      - Port Scan Check: Evaluate dc(dest_port) from source IPs
+      - Exfiltration Check: Evaluate sum(bytes) to external IPs
+      - Lateral Movement Check: Evaluate internal admin port access
+
+    STEP 6 - Calculate Confidence and Generate Findings:
+      - Analyze results against known threat patterns
+      - Assign confidence based on data volume, patterns, and port types
+      - High confidence requires clear anomalies (e.g., 100x normal traffic, massive scanning)
+    
+  investigation_template: |
+    Investigate VPC Flow Log activity:
+    Target IP: {target_ip}
+    Alert Type: {alert_type}
+    Time Window: {start_time} to {end_time}
+    Context: {context}
+    
+    Investigate:
+    1. What is the overall traffic volume and pattern for this IP?
+    2. What are the top destination ports and IPs?
+    3. Is there evidence of port scanning (many rejected connections to different ports)?
+    4. Is there evidence of data exfiltration (large outbound byte transfers)?
+    5. Are there suspicious connections to external/internet IPs?
+    6. Is there evidence of lateral movement (internal admin port access)?
+    7. What is the ACCEPT vs REJECT ratio?
+    8. Does this match known attack patterns?
+    9. Is this behavior normal for this VPC/subnet?
+    
+    Identify IOCs and suspicious network patterns.
+    CRITICAL: Adhere to the DATA CONDENSATION RULES. Do not list out thousands of IPs or ports. Summarize massive arrays.
+
+queries:
+  target_traffic_analysis: |
+    index=aws sourcetype=aws:cloudwatchlogs:vpcflow (src_ip={target_ip} OR dest_ip={target_ip})
+    earliest={start_time} latest={end_time}
+    | stats sum(bytes) as total_bytes, count by src_ip, dest_port, action
+    | sort -total_bytes
+    | head 50
+    
+  external_connections: |
+    index=aws sourcetype=aws:cloudwatchlogs:vpcflow src_ip={target_ip} action=ACCEPT
+    earliest={start_time} latest={end_time}
+    | where NOT match(dest_ip, "^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)")
+    | stats count, sum(bytes) as total_bytes by dest_ip, dest_port, action
+    | sort -total_bytes
+    | head 50
+    
+  denied_traffic: |
+    index=aws sourcetype=aws:cloudwatchlogs:vpcflow src_ip={target_ip} action=REJECT
+    earliest={start_time} latest={end_time}
+    | stats count by dest_ip, dest_port
+    | sort -count
+    | head 50
+    
+  port_scan_check: |
+    index=aws sourcetype=aws:cloudwatchlogs:vpcflow src_ip={target_ip} action=REJECT
+    earliest={start_time} latest={end_time}
+    | stats dc(dest_port) as unique_ports, count by dest_ip
+    | where unique_ports > 10
+    | sort -unique_ports
+    | head 50
+    
+  large_transfers: |
+    index=aws sourcetype=aws:cloudwatchlogs:vpcflow src_ip={target_ip} action=ACCEPT
+    earliest={start_time} latest={end_time}
+    | stats sum(bytes) as total_bytes by dest_ip
+    | where total_bytes > 50000000
+    | sort -total_bytes
+    | head 50
+    
+  lateral_movement_check: |
+    index=aws sourcetype=aws:cloudwatchlogs:vpcflow src_ip={target_ip} action=ACCEPT 
+    (dest_port=22 OR dest_port=445 OR dest_port=3389 OR dest_port=5985 OR dest_port=5986)
+    earliest={start_time} latest={end_time}
+    | where match(dest_ip, "^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)")
+    | stats count by dest_ip, dest_port
+    | sort -count
+    | head 50
+
+output_schema:
+  type: mixed
+  fields:
+    traffic_summary: object
+    suspicious_indicators: array
+    iocs: array
+    mitre_techniques: array
+    confidence: float
+    exfiltration_detected: boolean
+    scan_detected: boolean
+    notable_entities: array
+
+escalation_rules:
+  - condition: "large_exfiltration_detected"
+    severity: critical
+    notify: ["network_security", "incident_response"]
+  - condition: "internal_scanning_detected"
+    severity: high
+    notify: ["network_security"]
+
+timeout: 180

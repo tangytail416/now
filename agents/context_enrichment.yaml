@@ -1,0 +1,314 @@
+# ----------------------------------------------------------------------------
+# 2. CONTEXT ENRICHMENT AGENT
+# ----------------------------------------------------------------------------
+---
+name: context_enrichment
+version: "1.0.1"
+type: specialist
+enabled: true
+domain: context
+description: |
+  Gathers baseline context about entities involved in an alert.
+  Enriches users, IPs, hostnames, and files with historical and external data.
+
+model:
+  provider: anthropic
+  model_name: claude-sonnet-4-20250514
+  temperature: 0.1
+  max_tokens: 65536
+
+capabilities:
+  - user_enrichment
+  - ip_enrichment
+  - hostname_enrichment
+  - file_hash_enrichment
+  - threat_intelligence_lookup
+
+triggers:
+  - alert_type: "*"
+    conditions:
+      requires_context: true
+
+tools:
+  - name: splunk
+    type: splunk_query
+    config:
+      host: "${SPLUNK_HOST}"
+      port: 8089
+      username: "${SPLUNK_USER}"
+      password: "${SPLUNK_PASSWORD}"
+    rate_limit:
+      requests_per_minute: 30
+      
+  - name: user_directory
+    type: api_call
+    config:
+      endpoint: /api/v1/users
+      auth_type: bearer_token
+      
+  - name: asset_inventory
+    type: database_query
+    config:
+      connection_string: "${ASSET_DB_CONNECTION}"
+      
+  - name: threat_intel
+    type: api_call
+    config:
+      endpoint: https://api.threatintel.example.com
+      auth_type: api_key
+      timeout: 10
+
+prompts:
+  system: |
+    You are the Context Enrichment Agent specializing in gathering baseline information about security alert entities.
+    Your job is to enrich users, IP addresses, hostnames, and file hashes with contextual data that helps determine if behavior is normal or anomalous.
+
+    ENTITY TYPES YOU PROCESS:
+    1. Users (usernames, email addresses)
+    2. IP addresses (internal and external)
+    3. Hostnames/computers
+    4. File hashes (MD5, SHA1, SHA256)
+
+    === SPLUNK QUERY GENERATION RULES (CRITICAL TO PREVENT SYSTEM CRASHES) ===
+    If you query Splunk improperly, you will crash your context window. You MUST follow these rules:
+    1. ALWAYS AGGREGATE: You must use `| stats`, `| timechart`, or `| top` in almost every query.
+    2. MANDATORY ROW LIMITS: You MUST append `| head 30` to the very end of EVERY SINGLE QUERY to protect the system. NEVER pull more than 30 records.
+    3. NO RAW LOG DUMPS: Never run a query that returns raw unformatted logs (e.g., `index=* src_ip=1.1.1.1`). Always summarize it.
+    4. DANGER - AVOID HIGH-CARDINALITY ARRAYS: NEVER use `values()` or `list()` on fields that contain highly variable, long strings (like `uri`, `url`, `CommandLine`, or `query`). If an attacker runs a fuzzer, `values(uri)` will pack thousands of massive payloads into a single row and crash the system. 
+       - INSTEAD: Group BY the variable field to find the most common ones. 
+       - Example (SAFE): `... | stats count by httpRequest.uri | sort - count | head 10`
+       - Example (CRASHES): `... | stats count, values(httpRequest.uri) by src_ip`
+
+    === PREDEFINED SAFE QUERIES ===
+    Use these exact queries when investigating entities (replace the bracketed variables):
+
+    1. User Historical Activity:
+       `index=windows OR index=authentication user={username} earliest=-30d | stats count by sourcetype, action, src_ip | sort -count | head 30`
+       
+    2. IP Reputation & History:
+       `index=network OR index=proxy OR index=firewall OR index=waf src_ip={ip_address} OR dest_ip={ip_address} earliest=-30d | stats count, sum(bytes) as total_bytes by action, dest_port, index | sort -count | head 30`
+       
+    3. Hostname Profile:
+       `index=* host={hostname} earliest=-7d | stats count by sourcetype, user | sort -count | head 30`
+       
+    4. File Hash History:
+       `index=endpoint sourcetype=av OR sourcetype=edr file_hash={hash} earliest=-30d | stats count, dc(host) as seen_on_host_count, dc(user) as distinct_users by action`
+
+    === LEVERAGING HISTORICAL INTELLIGENCE ===
+    BEFORE conducting your detailed enrichment, review the HISTORICAL INTELLIGENCE section in your investigation context:
+    - RELATED PAST INVESTIGATIONS: What was the outcome of those investigations?
+    - KNOWN FALSE POSITIVES: Pay special attention to whitelisted entities. Lower their risk scores accordingly.
+
+    YOUR STEP-BY-STEP INVESTIGATION PROCESS:
+
+    === USER ENRICHMENT ===
+    STEP 1 - Query user directory (if available).
+    STEP 2 - Query Splunk for logon baseline using the Safe Query above.
+    STEP 3 - Compare current activity to baseline (identify anomalies in IP or time).
+    STEP 4 - Calculate user risk score (0.0 to 1.0).
+
+    === IP ADDRESS ENRICHMENT ===
+    STEP 1 - Determine if IP is internal (RFC1918) or external.
+    STEP 2 - For external IPs, query threat intelligence (if tool available).
+    STEP 3 - Query Splunk for IP history using the Safe Query above. 
+             If count > 100, IP is known. If 0, it is first time seen.
+
+    === HOSTNAME ENRICHMENT ===
+    STEP 1 - Query asset inventory (if available).
+    STEP 2 - Query Splunk for recent security events using the Safe Query above.
+    STEP 3 - Check asset criticality to multiply risk score.
+
+    === FILE HASH ENRICHMENT ===
+    STEP 1 - Query threat intelligence for hash.
+    STEP 2 - Query Splunk for hash prevalence using the Safe Query above.
+             If seen_on_host_count == 1: UNIQUE. If > 10: COMMON.
+
+    === OUTPUT FORMAT ===
+    Return JSON with this EXACT structure:
+    {
+      "entity_type": "user|ip|hostname|file_hash",
+      "entity_id": "<the actual identifier>",
+      "enrichment": {
+        "attributes": {},
+        "baseline_summary": {
+          "typical_behaviors": ["string"],
+          "deviations": ["string"]
+        },
+        "risk_score": 0.85,
+        "risk_level": "HIGH|MEDIUM|LOW",
+        "anomalies": [
+          {
+            "type": "ip_deviation|first_time_seen",
+            "description": "string",
+            "severity": "high|medium|low",
+            "evidence": "string"
+          }
+        ],
+        "threat_intel": {
+          "reputation_score": 75,
+          "categories": ["proxy", "suspicious"],
+          "verdict": "MEDIUM"
+        },
+        "confidence": 0.9
+      },
+      "notable_entities": [],
+      "notable_relationships": []
+    }
+
+queries:
+  user_historical_activity:
+    query: |
+      index=windows OR index=authentication
+      user={username}
+      earliest=-30d
+      | stats count by sourcetype, action, src_ip
+      | sort -count
+      | head 50
+    purpose: "Establish user's normal logon IP address and activity baseline, capped at top 50 patterns"
+    expected_results: "List of source IPs with event counts, sorted by frequency"
+    interpretation:
+      - "First row (highest count) = user's most common logon IP"
+      - "If unique source IPs < 3: user has very consistent logon pattern"
+      - "If unique source IPs > 10: user has variable logon pattern (may be legitimate for remote/traveling workers)"
+      - "If current alert IP NOT in results: significant deviation from 30-day baseline"
+    decision_logic:
+      - condition: "current_ip equals top result src_ip"
+        conclusion: "IP is user's primary/normal logon location"
+        confidence: 0.95
+        action: "No IP anomaly"
+      - condition: "current_ip in top 3 results"
+        conclusion: "IP is part of normal pattern"
+        confidence: 0.9
+        action: "No IP anomaly"
+      - condition: "current_ip in results but not top 3"
+        conclusion: "IP is known but uncommon for this user"
+        confidence: 0.6
+        action: "Flag as minor IP deviation"
+      - condition: "current_ip NOT in results at all"
+        conclusion: "IP is completely new/anomalous for this user"
+        confidence: 0.3
+        action: "Flag as major IP anomaly, investigate further"
+
+  ip_reputation:
+    query: |
+      index=network OR index=proxy OR index=firewall
+      src_ip={ip_address} OR dest_ip={ip_address}
+      earliest=-30d
+      | stats count, sum(bytes) as total_bytes by action, dest_port
+      | sort -count
+      | head 50
+    purpose: "Determine if IP address has been seen before in network logs and summarize top 50 interactions"
+    expected_results: "Network activity summary for this IP (actions, ports, aggregated data transferred)"
+    interpretation:
+      - "If total event count > 100: IP is well-known/frequently seen in environment"
+      - "If total event count 10-100: IP is occasionally seen"
+      - "If total event count < 10: IP is rarely seen"
+      - "If NO results: First time this IP has been observed"
+      - "Check dest_port values: 80/443=web, 22=SSH, 3389=RDP, 445=SMB"
+    decision_logic:
+      - condition: "total events > 100"
+        conclusion: "IP is well-established in environment"
+        confidence: 0.9
+        action: "Lower suspicion - known IP"
+      - condition: "total events 10-100"
+        conclusion: "IP is occasionally seen"
+        confidence: 0.7
+        action: "Moderate suspicion - investigate context"
+      - condition: "total events < 10"
+        conclusion: "IP is rarely seen"
+        confidence: 0.5
+        action: "Higher suspicion - unusual IP"
+      - condition: "NO results returned"
+        conclusion: "First time IP observed in environment"
+        confidence: 0.4
+        action: "Flag as 'first_time_seen', high suspicion"
+
+  hostname_profile:
+    query: |
+      index=* host={hostname}
+      earliest=-7d
+      | stats count by sourcetype, user
+      | sort -count
+      | head 50
+    purpose: "Get top 50 recent activity summary for hostname to detect anomalies"
+    expected_results: "Top Event types and users associated with this host in past week"
+    interpretation:
+      - "Common sourcetypes: WinEventLog:Security, WinEventLog:System, Sysmon, antivirus"
+      - "If NO results: Host may be offline, new, or not sending logs (CRITICAL ISSUE)"
+      - "Check user list: should match expected users for this asset"
+      - "Unexpected users accessing host = potential compromise"
+    decision_logic:
+      - condition: "NO results returned"
+        conclusion: "Host not logging or doesn't exist"
+        confidence: 0.2
+        action: "Flag 'host_not_found' - possible unmanaged device or log collection failure"
+      - condition: "results show only expected users"
+        conclusion: "Normal user activity pattern"
+        confidence: 0.8
+        action: "No user anomaly detected"
+      - condition: "results show unexpected/unknown users"
+        conclusion: "Unauthorized user access detected"
+        confidence: 0.9
+        action: "Flag as 'unauthorized_access' anomaly, HIGH severity"
+      - condition: "antivirus or EDR sourcetype present with recent events"
+        conclusion: "Host has active security monitoring"
+        confidence: 0.9
+        action: "Good visibility into host"
+
+  file_hash_history:
+    query: |
+      index=endpoint sourcetype=av OR sourcetype=edr
+      file_hash={hash}
+      earliest=-30d
+      | stats count, dc(host) as seen_on_host_count, dc(user) as distinct_users by action
+    purpose: "Determine file hash prevalence across organization safely using distinct counts"
+    expected_results: "Aggregated count of events, distinct hosts, and distinct users by action"
+    interpretation:
+      - "seen_on_host_count = how widespread this file is"
+      - "If seen_on_host_count == 1: UNIQUE/targeted"
+      - "If seen_on_host_count between 2-5: RARE/potentially spreading"
+      - "If seen_on_host_count > 10: COMMON/might be legitimate software or widespread malware"
+      - "Check 'action' field: quarantine/delete = previously detected as malicious"
+    decision_logic:
+      - condition: "action contains 'quarantine' or 'delete' or 'block'"
+        conclusion: "File was previously detected as malicious by AV/EDR"
+        confidence: 0.95
+        action: "Flag as KNOWN MALICIOUS, CRITICAL severity"
+      - condition: "seen_on_host_count == 1 AND action == 'allow'"
+        conclusion: "File is unique to single host"
+        confidence: 0.7
+        action: "Flag as 'unique_file' - could be targeted attack or legitimate rare file"
+      - condition: "seen_on_host_count >= 2 AND seen_on_host_count <= 5"
+        conclusion: "File is rare, possibly spreading"
+        confidence: 0.6
+        action: "Flag as 'rare_file' - monitor for further spread"
+      - condition: "seen_on_host_count > 10"
+        conclusion: "File is common across organization"
+        confidence: 0.8
+        action: "Likely legitimate software, but verify with threat intel"
+      - condition: "NO results"
+        conclusion: "First time this file hash has been seen"
+        confidence: 0.5
+        action: "Flag as 'first_time_seen' - could be new malware or legitimate new file"
+
+output_schema:
+  type: json
+  fields:
+    entity_type: string
+    entity_id: string
+    enrichment:
+      attributes: object
+      historical_summary: string
+      risk_score: float
+      threat_intel_matches: array
+      anomalies: array
+      confidence: float
+    notable_entities: array
+    notable_relationships: array
+
+confidence_thresholds:
+  high: 0.8
+  medium: 0.5
+  low: 0.3
+
+timeout: 120

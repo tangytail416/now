@@ -1,0 +1,276 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Alert {
+  id             String          @id @default(cuid())
+  source         String
+  severity       String
+  title          String
+  description    String?
+  rawData        Json            @map("raw_data")
+  status         String          @default("new")
+  timestamp      DateTime        @default(now())
+  createdAt      DateTime        @default(now()) @map("created_at")
+  updatedAt      DateTime        @updatedAt @map("updated_at")
+  investigations Investigation[]
+
+  @@index([status])
+  @@index([severity])
+  @@index([timestamp])
+  @@map("alerts")
+}
+
+model Investigation {
+  id              String           @id @default(cuid())
+  alertId         String           @map("alert_id")
+  status          String           @default("pending")
+  priority        String           @default("medium")
+  classificationTags  String[]
+  threatTypeTags  String[]
+  campaignTags    String[]
+  aiProvider      String?          @map("ai_provider")
+  modelUsed       String?          @map("model_used")
+  findings        Json?
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+  completedAt     DateTime?        @map("completed_at")
+  agentExecutions AgentExecution[]
+  alert           Alert            @relation(fields: [alertId], references: [id], onDelete: Cascade)
+  reports         Report[]
+
+  @@index([status])
+  @@index([alertId])
+  @@map("investigations")
+}
+
+model AgentExecution {
+  id              String        @id @default(cuid())
+  investigationId String        @map("investigation_id")
+  agentName       String        @map("agent_name")
+  status          String        @default("pending")
+  modelUsed       String?       @map("model_used")
+  prompt          String?
+  result          Json?
+  errorMessage    String?       @map("error_message")
+  executionTime   Int?          @map("execution_time")
+  confidence      Float?
+  startedAt       DateTime?     @map("started_at")
+  completedAt     DateTime?     @map("completed_at")
+  createdAt       DateTime      @default(now()) @map("created_at")
+  investigation   Investigation @relation(fields: [investigationId], references: [id], onDelete: Cascade)
+
+  @@index([investigationId])
+  @@index([status])
+  @@index([agentName])
+  @@map("agent_executions")
+}
+
+model Report {
+  id              String        @id @default(cuid())
+  investigationId String        @map("investigation_id")
+  title           String
+  content         Json
+  summary         String?
+  recommendations String?
+  createdAt       DateTime      @default(now()) @map("created_at")
+  investigation   Investigation @relation(fields: [investigationId], references: [id], onDelete: Cascade)
+
+  @@index([investigationId])
+  @@map("reports")
+}
+
+model TagConfig {
+  id        String  @id @default(cuid())
+  category  String  @unique
+  values    String[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model AIProvider {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  type      String
+  baseUrl   String?  @map("base_url")
+  modelName String   @map("model_name")
+  isActive  Boolean  @default(true) @map("is_active")
+  isDefault Boolean  @default(false) @map("is_default")
+  config    Json?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("ai_providers")
+}
+
+model SplunkConfig {
+  id                 String    @id @default(cuid())
+  host               String
+  port               Int       @default(8089)
+  scheme             String    @default("https")
+  username           String?
+  password           String?
+  apiToken           String?   @map("api_token")
+  isActive           Boolean   @default(true) @map("is_active")
+  indexStructure     Json?     @map("index_structure")
+  structureFetchedAt DateTime? @map("structure_fetched_at")
+  excludedIndexes    String?   @map("excluded_indexes")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+
+  @@map("splunk_config")
+}
+
+model Neo4jConfig {
+  id                String    @id @default(cuid())
+  uri               String
+  username          String
+  password          String
+  database          String    @default("neo4j")
+  isActive          Boolean   @default(true) @map("is_active")
+  schemaInitialized Boolean   @default(false) @map("schema_initialized")
+  lastTestedAt      DateTime? @map("last_tested_at")
+  nodeCount         Int?      @map("node_count")
+  relationshipCount Int?      @map("relationship_count")
+  lastStatsUpdate   DateTime? @map("last_stats_update")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  @@map("neo4j_config")
+}
+
+model IOCWhitelist {
+  id        String   @id @default(cuid())
+  type      String
+  value     String
+  reason    String?
+  addedBy   String?
+  isActive  Boolean  @default(true) @map("is_active")
+  metadata  Json?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([type, value])
+  @@index([type])
+  @@index([isActive])
+  @@map("ioc_whitelist")
+}
+
+model ThreatHunt {
+  id            String          @id @default(cuid())
+  status        String          @default("active")
+  startedAt     DateTime        @default(now()) @map("started_at")
+  lastRunAt     DateTime?       @map("last_run_at")
+  completedAt   DateTime?       @map("completed_at")
+  findingsCount Int             @default(0) @map("findings_count")
+  cyclesRun     Int             @default(0) @map("cycles_run")
+  config        Json?
+  errorMessage  String?         @map("error_message")
+  createdAt     DateTime        @default(now()) @map("created_at")
+  updatedAt     DateTime        @updatedAt @map("updated_at")
+  findings      ThreatFinding[]
+
+  @@index([status])
+  @@index([startedAt])
+  @@map("threat_hunts")
+}
+
+model ThreatFinding {
+  id               String      @id @default(cuid())
+  threatHuntId     String      @map("threat_hunt_id")
+  findingHash      String      @map("finding_hash")
+  findingType      String      @map("finding_type")
+  affectedEntities Json        @map("affected_entities")
+  description      String
+  severity         String
+  confidence       Float?
+  rawData          Json        @map("raw_data")
+  mitreAttack      String?     @map("mitre_attack")
+  alertId          String?     @map("alert_id")
+  investigationId  String?     @map("investigation_id")
+  savedQueryId     String?     @map("saved_query_id")
+  status           String      @default("pending")
+  detectedAt       DateTime    @default(now()) @map("detected_at")
+  createdAt        DateTime    @default(now()) @map("created_at")
+  savedQuery       SavedQuery? @relation(fields: [savedQueryId], references: [id])
+  threatHunt       ThreatHunt  @relation(fields: [threatHuntId], references: [id], onDelete: Cascade)
+
+  @@unique([threatHuntId, findingHash])
+  @@index([threatHuntId])
+  @@index([findingType])
+  @@index([status])
+  @@index([severity])
+  @@index([savedQueryId])
+  @@map("threat_findings")
+}
+
+model SavedQuery {
+  id                   String           @id @default(cuid())
+  name                 String
+  description          String?
+  splQuery             String           @map("spl_query")
+  category             QueryCategory    @default(other)
+  severity             String?
+  mitreAttack          String?          @map("mitre_attack")
+  isAutomated          Boolean          @default(false) @map("is_automated")
+  findingsCount        Int              @default(0) @map("findings_count")
+  executionsCount      Int              @default(0) @map("executions_count")
+  lastExecutedAt       DateTime?        @map("last_executed_at")
+  effectivenessScore   Float?           @default(0.0) @map("effectiveness_score")
+  successRate          Float?           @default(0.0) @map("success_rate")
+  avgResultsReturned   Float?           @default(0.0) @map("avg_results_returned")
+  falsePositiveRate    Float?           @default(0.0) @map("false_positive_rate")
+  alertType            String?          @map("alert_type")
+  investigationContext Json?            @map("investigation_context")
+  findingsProduced     Json?            @map("findings_produced")
+  autoSaved            Boolean          @default(false) @map("auto_saved")
+  createdAt            DateTime         @default(now()) @map("created_at")
+  updatedAt            DateTime         @updatedAt @map("updated_at")
+  executions           QueryExecution[]
+  threatFindings       ThreatFinding[]
+
+  @@index([category])
+  @@index([severity])
+  @@index([isAutomated])
+  @@index([lastExecutedAt])
+  @@index([effectivenessScore])
+  @@index([alertType])
+  @@map("saved_queries")
+}
+
+model QueryExecution {
+  id              String      @id @default(cuid())
+  savedQueryId    String?     @map("saved_query_id")
+  executedBy      String?     @map("executed_by")
+  status          String
+  resultCount     Int?        @map("result_count")
+  executionTimeMs Int?        @map("execution_time_ms")
+  timeRange       Json?       @map("time_range")
+  errorMessage    String?     @map("error_message")
+  createdAt       DateTime    @default(now()) @map("created_at")
+  savedQuery      SavedQuery? @relation(fields: [savedQueryId], references: [id])
+
+  @@index([savedQueryId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("query_executions")
+}
+
+enum QueryCategory {
+  authentication
+  endpoint
+  network
+  privilege_escalation
+  data_exfiltration
+  malware
+  lateral_movement
+  persistence
+  defense_evasion
+  discovery
+  other
+}
