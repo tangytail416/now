@@ -83,11 +83,10 @@ export async function chatWithContextManagement(
           console.log(`[AI Wrapper] Retrying with summarized context...`);
           continue;
           
-		} catch (summarizationError: any) {
+        } catch (summarizationError: any) {
           console.error(`[AI Wrapper] ❌ Summarization failed:`, summarizationError.message);
-          // Throw a clean error using only variables in scope
           throw new Error(
-            `Context too large and automatic summarization failed: ${summarizationError.message}. Original error: ${error.message}`
+            `Context too large and automatic summarization failed: ${summarizationError.message}`
           );
         }
       } else if (isContextError) {

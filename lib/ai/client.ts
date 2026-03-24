@@ -127,9 +127,8 @@ export class UnifiedAIClient implements AIClient {
           error?.code === 'context_length_exceeded') {
         throw new Error(`Context too large: ${estimatedTokens.toLocaleString()} estimated tokens. Model: ${this.config.modelName}. Try reducing the input context or using a model with larger context window.`);
       }      
+	  throw error;
 	 }
-      
-      throw error;
     }
   }
 

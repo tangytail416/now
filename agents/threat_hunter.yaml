@@ -46,7 +46,7 @@ prompts:
 
     When generating your JSON output and descriptions:
     1. Look for the `human_first_seen` and `human_last_seen` strings in the Splunk results.
-    2. COPY AND PASTE THEM EXACTLY. Do not alter or round them.
+    2. You must output whole numbers. If there is the decimal at the end (like .0), truncate them.
     3. If the Splunk query fails to provide human-readable strings, you MUST output the raw 10-digit Unix timestamp (e.g., "1715000000"). NEVER guess the human-readable date.
     4. Your `description` MUST explicitly state the time (e.g., "Activity observed between [human_first_seen] and [human_last_seen]").
 

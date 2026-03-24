@@ -651,7 +651,7 @@ async function executeSpecialistAgent(
       }
 
       // If context exceeds 90k tokens, summarize agent findings
-      const CONTEXT_THRESHOLD = 110000;
+      const CONTEXT_THRESHOLD = 90000;
       if (contextTokens > CONTEXT_THRESHOLD) {
         console.log(`[Agent: ${agentName}] ⚠️  Context size (${contextTokens.toLocaleString()} tokens) exceeds threshold (${CONTEXT_THRESHOLD.toLocaleString()})`);
         console.log(`[Agent: ${agentName}] Summarizing context to prevent token limit issues...`);
@@ -766,7 +766,7 @@ async function executeSpecialistAgent(
           error: error.message,
           analysis: {
             status: 'incomplete',
-            reason: 'Context too large for LLM even even after summarization',
+            reason: 'May have problem, but there are a few findings',
             partial_findings: agentFindings.slice(-3), // Last 3 findings
           },
         });
@@ -889,8 +889,8 @@ async function executeSpecialistAgent(
           const resultsTokenCount = estimateTokenCount(JSON.stringify(results));
           console.log(`[Agent: ${agentName}] Results token count: ${resultsTokenCount.toLocaleString()} tokens`);
 
-          // If results are too large (>90k tokens), prompt agent to refine query
-          const RESULTS_TOKEN_THRESHOLD = 90000;
+          // If results are too large (>60k tokens), prompt agent to refine query
+          const RESULTS_TOKEN_THRESHOLD = 60000;
           if (resultsTokenCount > RESULTS_TOKEN_THRESHOLD) {
             console.log(`[Agent: ${agentName}] ⚠️  Query results too large (${resultsTokenCount.toLocaleString()} tokens > ${RESULTS_TOKEN_THRESHOLD.toLocaleString()} threshold)`);
 
@@ -903,38 +903,35 @@ async function executeSpecialistAgent(
                 iteration: agentIteration,
                 resultCount: results.length,
                 tokenCount: resultsTokenCount,
-                warning: 'Results too large - please refine query with more filters or reduce time range',
+                warning: 'Results too large - please refine query with more filters, aggregation or reduce time range',
               },
               timestamp: new Date(),
             });
 
             // Store a truncated version with guidance to refine
+// Store a truncated version with guidance to refine
             agentFindings.push({
               iteration: agentIteration,
               action: 'query',
               query: searchQuery,
-              results: results.slice(0, 10), // Only keep first 10 as sample
+              reasoning: agentDecision.reasoning,
+              
+              // 1. Change the status to 'error' so the LLM knows the action failed
               result_summary: {
+                status: 'error', 
                 total_count: results.length,
                 token_count: resultsTokenCount,
-                status: 'truncated',
-                message: `Query returned ${resultsTokenCount.toLocaleString()} tokens (>${RESULTS_TOKEN_THRESHOLD.toLocaleString()}). Only showing first 10 results as sample.`
+                message: `SYSTEM EXCEPTION: Token limit exceeded.`
               },
-              reasoning: agentDecision.reasoning,
-              refinement_needed: true,
-              refinement_guidance: `Your query returned too much data (${resultsTokenCount.toLocaleString()} tokens). Please refine your query by:
-1. Adding more specific filters (e.g., specific eventName, sourceIPAddress, or userName)
-2. Reducing the time range (e.g., use earliest=-1h instead of -24h)
-3. Using aggregation commands (| stats, | rare, | top) instead of returning raw events
-4. Adding | head N to limit results to a specific number
-5. Using more precise field filters to target specific events
-
-Example refinements:
-- Instead of: index=cloudtrail earliest=-24h
-- Try: index=cloudtrail eventName=CreateAccessKey earliest=-1h | head 20
-- Or: index=cloudtrail userIdentity.userName=suspi cious-user earliest=-6h
-
-The sample of 10 results is shown below for reference.`
+              
+              // 2. Introduce an explicit 'error' field with a strict, non-conversational system log
+              error: `QUERY REJECTED: Result size (${resultsTokenCount.toLocaleString()} tokens) exceeds the absolute system limit of ${RESULTS_TOKEN_THRESHOLD.toLocaleString()} tokens.`,
+              
+              // 3. Provide a strict directive instead of polite guidance
+              system_directive: `CRITICAL ACTION REQUIRED: Your previous query crashed the context window. In your next iteration, you MUST write a new, highly-aggregated query. Append '| stats count by ...' or strictly limit rows using '| head 30'. DO NOT use 'values()' on high-variance fields like URIs or CommandLines.`,
+              
+              // 4. Shrink the sample size so it doesn't accidentally trigger the AI client rate limits we fixed earlier
+              results: results.slice(0, 2) 
             });
 
             console.log(`[Agent: ${agentName}] Results truncated to 10 sample entries. Agent will be prompted to refine query.`);
@@ -1315,7 +1312,7 @@ CRITICAL INSTRUCTIONS:
   console.log(`[Orchestrator] Current context size: ${contextTokens.toLocaleString()} tokens`);
 
   // If context exceeds threshold, we're in a critical state
-  const CRITICAL_THRESHOLD = 200000;
+  const CRITICAL_THRESHOLD = 140000;
   if (contextTokens > CRITICAL_THRESHOLD) {
     console.log(`[Orchestrator] ⚠️  Context size exceeds critical threshold (${CRITICAL_THRESHOLD.toLocaleString()} tokens)`);
     console.log(`[Orchestrator] Forcing investigation completion to prevent token overflow`);

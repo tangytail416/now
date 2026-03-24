@@ -116,7 +116,7 @@ export function ThreatHuntForm({ onSuccess }: ThreatHuntFormProps) {
           last_7d: { earliest: '-7d', latest: 'now' },
           last_30d: { earliest: '-30d', latest: 'now' },
           last_90d: { earliest: '-90d', latest: 'now' },
-	  last_ytd: { earliest: `01/01/${new Date().getFullYear()}:00:00:00`, latest: 'now'},
+		  last_ytd: { earliest: `01/01/${new Date().getFullYear()}:00:00:00`, latest: 'now'},
         };
         timeRange = presets[timeRangePreset];
       }
@@ -166,7 +166,7 @@ export function ThreatHuntForm({ onSuccess }: ThreatHuntFormProps) {
             <SelectItem value="last_7d">Last 7 Days</SelectItem>
             <SelectItem value="last_30d">Last 30 Days</SelectItem>
             <SelectItem value="last_90d">Last 90 Days</SelectItem>
-	    <SelectItem value="last_ytd">Year-To-Date</SelectItem>
+			<SelectItem value="last_ytd">Year-To-Date</SelectItem>
             <SelectItem value="all_time">All Time</SelectItem>
             <SelectItem value="custom">Custom</SelectItem>
           </SelectContent>

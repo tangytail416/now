@@ -847,6 +847,7 @@ function mapFindingTypeToCategory(findingType: string): string {
     'lateral_movement': 'lateral_movement',
     'data_exfiltration': 'data_exfiltration',
     'network_anomaly': 'network',
+	'prompt_injection':'malicious_prompting',
     'persistence': 'persistence',
     'defense_evasion': 'defense_evasion',
     'discovery': 'discovery',
@@ -1044,6 +1045,13 @@ async function processFinding(
     // Trigger investigation workflow only if auto-start is enabled
     if (config.autoStartInvestigations) {
       console.log(`[Threat Hunt] Auto-starting agentic workflow for investigation: ${investigationId}`);
+	  await prisma.investigation.update({
+        where: { id: investigationId },
+        data: { 
+          status: 'active',
+          startedAt: new Date()
+        }
+      });
       executeAgenticWorkflow(investigationId, alert, config.aiProvider || 'openrouter').catch((error) => {
         console.error(`[Threat Hunt] Error in agentic workflow for ${investigationId}:`, error);
       });

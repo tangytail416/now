@@ -10,7 +10,7 @@ model:
   provider: openrouter
   model_name: z-ai/glm-4.6
   temperature: 0.1
-  max_tokens: 65536
+  max_tokens: 16384
 
 prompts:
   system: |
