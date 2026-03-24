@@ -17,7 +17,9 @@ function convertTimestampsInString(str: string): string {
 
 function convertTimestampsInObj(obj: any): any {
   if (obj === null || obj === undefined) return obj;
-
+	if (obj instanceof Date) {
+    return obj; // Leave native Date objects completely alone
+  }
   if (typeof obj === 'number') {
     // 10-digit timestamp (seconds)
     if (obj >= 1600000000 && obj <= 1999999999) {
