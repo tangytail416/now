@@ -37,6 +37,7 @@ model Investigation {
   aiProvider      String?          @map("ai_provider")
   modelUsed       String?          @map("model_used")
   findings        Json?
+  startedAt       DateTime?        @map("start_at")
   createdAt       DateTime         @default(now()) @map("created_at")
   updatedAt       DateTime         @updatedAt @map("updated_at")
   completedAt     DateTime?        @map("completed_at")

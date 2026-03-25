@@ -1049,7 +1049,7 @@ async function processFinding(
         where: { id: investigationId },
         data: { 
           status: 'active',
-          startedAt: new Date()
+		  startedAt: new Date()
         }
       });
       executeAgenticWorkflow(investigationId, alert, config.aiProvider || 'openrouter').catch((error) => {
