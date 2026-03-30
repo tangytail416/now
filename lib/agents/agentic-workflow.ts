@@ -1037,7 +1037,7 @@ async function executeSpecialistAgent(
         const isCompilingAgent = agentName === 'report_generator' || agentName === 'case_correlation';
         
         if (!isCompilingAgent && !judgeHasChallenged) {
-          console.log(`[Agent: ${agentName}] Agent wants to complete. Summoning the Judge...`);
+          console.log(`[Agent: ${agentName}] Agent wants to complete. Calling Judge...`);
           const judgeChallenge = await generateJudgeChallenge(
              aiProvider, 
              config.modelUsed || 'glm-5', 
@@ -1046,20 +1046,20 @@ async function executeSpecialistAgent(
           );
 
           if (judgeChallenge) {
-              console.log(`[Judge] ⚖️ Challenge Issued: Forcing ${agentName} to verify findings.`);
+              console.log(`[Judge] (WARNING) Challenge Issued: Forcing ${agentName} to verify findings.`);
               judgeHasChallenged = true; // Mark that the judge has spoken
               
               // Inject the Judge's challenge into the context
               agentFindings.push({
                  iteration: agentIteration,
                  action: 'judge_challenge',
-                 system_directive: `⚖️ THE REVIEWER HAS A CONFIRMATION REQUEST:\n\n"${judgeChallenge}"\n\nIf you ALREADY have the raw logs in your previous iterations to prove this, output action="report" and quote them. If not, output action="query" to confirm they are real. If you realize your claim was incorrect, revise your findings and output action="report".`,
+                 system_directive: `THE REVIEWER HAS A CONFIRMATION REQUEST:\n\n"${judgeChallenge}"\n\nIf you ALREADY have the raw logs in your previous iterations to prove this, output action="report" and quote them. If not, output action="query" to confirm they are real. If you realize your claim was incorrect, revise your findings and output action="report".`,
               });
               // Force the loop to continue
               agentComplete = false;
               continue; 
           }
-          console.log(`[Judge] ⚖️ Findings Approved.`);
+          console.log(`[Judge] (PASSED) Findings Approved.`);
           judgeHasChallenged = true; // Mark as approved so it doesn't run again
         }
         // -----------------------------------
