@@ -269,6 +269,7 @@ enum QueryCategory {
   privilege_escalation
   data_exfiltration
   malware
+  malicious_prompting
   lateral_movement
   persistence
   defense_evasion

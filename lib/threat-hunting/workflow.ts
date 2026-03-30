@@ -11,6 +11,7 @@
  */
 
 import { prisma } from '@/lib/db';
+import { generateJudgeChallenge } from '../agents/judge-evaluator';
 import { createAIClient } from '@/lib/ai';
 import { createSplunkClientFromDB } from '@/lib/splunk/client';
 import { loadAgentConfig } from '../agents/config-loader';
@@ -427,7 +428,7 @@ Generate query now:
 
     console.log(`[Threat Hunt] Generated query: ${generatedQuery.substring(0, 150)}...`);
 
-    // Step 2: Execute the query
+// Step 2: Execute the query
     const tempAgentConfig = {
       ...agentConfig,
       splunk_queries: {
@@ -440,11 +441,17 @@ Generate query now:
       },
     };
 
+    // FIX: Removed the fake timestamp so the Executor doesn't force a narrow 2-hour window.
+    // This allows the Agent's SPL 'earliest' and 'latest' dates to actually take effect.
     const queryResultsMap = await executeSplunkQueries(tempAgentConfig, {
       investigationId: 'threat-hunt',
-      alertData: { timestamp: new Date().toISOString() },
-      aiProvider: 'openrouter',
-    });
+      alertData: { 
+        is_threat_hunt: true,
+        time_range: timeRange // Pass the broad config range as a fallback
+      },
+      // Dynamically pass the active provider instead of hardcoding openrouter
+      aiProvider: aiClient?.providerName || aiClient?.provider || 'openrouter', 
+    } as any);
 
     const queryResults = queryResultsMap[objective.id] || [];
 
@@ -731,6 +738,58 @@ export async function executeThreatHuntWorkflow(
 console.log(`[Threat Hunt] All cycles completed. Initiating AI post-hunt deduplication...`);
 try {
   await executeAiPostHuntDeduplication(threatHuntId, config.aiProvider, config.modelUsed);
+//*/* --- NEW: POST-HUNT JUDGE VERIFICATION ---
+    /*console.log(`[Threat Hunt] Initiating Judge Verification Phase...`);
+    const finalFindings = await prisma.threatFinding.findMany({
+       where: { threatHuntId, status: 'pending' } // Only check findings that haven't been dismissed
+    });
+
+    for (const finding of finalFindings) {
+       const challenge = await generateJudgeChallenge(
+           config.aiProvider, 
+           config.modelUsed, 
+           'Threat Hunter', 
+           finding.description
+       );
+
+       if (challenge) {
+           console.log(`[Judge] Challenging finding ${finding.id}... forcing threat hunter to verify.`);
+           // Call a targeted execution of the Threat Hunter specifically to run the Judge's challenge query
+           const verificationResult = await runTargetedVerification(finding, challenge, config);
+           
+			if (verificationResult.error) {
+               // 1. API crashed or token limit hit - DO NOT delete the finding!
+               console.log(`[Judge] Verification skipped due to API error. Keeping finding ${finding.id} as pending. Reason: ${verificationResult.reason}`);
+           } else if (!verificationResult.confirmed) {
+               // 2. Safely executed, but no evidence was found. Reject it and append the reason.
+               const rejectReason = verificationResult.reason || 'No raw log evidence found to substantiate the claim.';
+               console.log(`[Judge] (ERROR!!!!!!) Hallucination detected. Reason: ${rejectReason}`);
+               
+               await prisma.threatFinding.update({
+                   where: { id: finding.id },
+                   data: { 
+                       status: 'false_positive', 
+                       description: finding.description + `\n\n[JUDGE_REJECTION]: ${rejectReason}` 
+                   }
+               });
+
+               // If this finding is attached to a parent alert, resolve the parent alert too
+               if (finding.alertId) {
+                   await prisma.alert.update({
+                       where: { id: finding.alertId },
+                       data: { 
+                           status: 'resolved', 
+                           description: `Resolved by Judge Agent: False Positive\nReason: ${rejectReason}` 
+                       }
+                   });
+               }
+           } else {
+               // 3. Evidence found!
+               console.log(`[Judge] Finding ${finding.id} verified.`);
+           }
+       }
+    }
+    // -----------------------------------------*/
 } catch (error) {
   console.error(`[Threat Hunt] AI Deduplication failed, but hunt will complete normally:`, error);
 }
@@ -1218,4 +1277,98 @@ function extractQueryFromResponse(response: string): string | null {
  */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Executes a targeted verification hunt to prove or disprove a finding based on the Judge's challenge.
+*/
+async function runTargetedVerification(
+  finding: any,
+  challenge: string,
+  config: any
+): Promise<{ confirmed: boolean; error?:boolean; reason?:string }> {
+  console.log(`[Threat Hunt] Running targeted verification for finding ${finding.id}...`);
+  
+  try {
+    const agentConfig = await loadAgentConfig('threat_hunter');
+    if (!agentConfig) return { confirmed: false };
+
+    const aiClient = await createAIClient(config.aiProvider, { modelName: config.modelUsed });
+    const splunkGuide = await loadAllGuides();
+    const splunkStructure = await loadSplunkStructure();
+    const timeRange = {
+      earliest: config.timeRange?.earliest || '0',
+      latest: config.timeRange?.latest || 'now',
+    };
+
+    // 👇 FETCH SPLUNK STRUCTURE FOR THE PROMPT 👇
+    let discoveredStructure = '';
+    try {
+      const splunkConfig = await prisma.splunkConfig.findFirst({
+        where: { isActive: true },
+        select: { indexStructure: true },
+      });
+
+      if (splunkConfig?.indexStructure) {
+        discoveredStructure = `\n=== AVAILABLE SPLUNK INDEXES & FIELDS ===\n${JSON.stringify(splunkConfig.indexStructure)}\n`;
+      }
+    } catch (dbError) {
+      console.error('[Threat Hunt] Could not load index structure for verification');
+    }
+    // 👆 --------------------------------------- 👆
+
+    // Create a temporary objective strictly based on the Judge's challenge
+    const objective: HuntObjective = {
+      id: `verify-${finding.id}`,
+      name: `Verification: ${finding.findingType || 'Suspicious Activity'}`,
+      description: `JUDGE DIRECTIVE: ${challenge}`,
+      whatToLookFor: [challenge],
+      category: 'verification',
+      priority: 'high'
+    };
+
+    const systemPrompt = `
+    You are an expert Splunk threat hunter. 
+    Your objective is to run a targeted Splunk query to verify this specific claim:
+    
+    CLAIM TO VERIFY:
+    ${challenge}
+    
+    ${discoveredStructure}
+    
+    IMPORTANT RULES FOR VERIFICATION QUERIES:
+    1. Output ONLY the raw Splunk SPL query. Do not use markdown, do not use JSON.
+    2. Write BROAD, simple queries to pull the raw logs. Avoid complex 'stats', 'eval', or 'where' clauses on your first attempt.
+    3. Use simple wildcard searches (e.g., *bedrock* OR *nova*) rather than strict field matching if you are unsure of the exact field names.
+    4. Always include earliest= and latest= bounds based on the timeframes mentioned in the claim.
+    `;
+
+    const result = await executeHuntObjective(
+      aiClient,
+      agentConfig,
+      objective,
+      splunkGuide,
+      splunkStructure,
+      1, // We only need 1 hard piece of evidence to confirm it
+      timeRange,
+      []
+    );
+
+    // If the agent was able to successfully query and return a finding based on the strict challenge, it is confirmed!
+    if (result && result.findings && result.findings.length > 0) {
+      return { confirmed: true };
+    }
+
+    return { 
+      confirmed: false, 
+      reason: "The targeted verification query returned 0 results in Splunk. The claimed logs could not be found." 
+    };
+  } catch (error: any) {
+    console.error(`[Threat Hunt] Verification failed to execute:`, error);
+    return { 
+      confirmed: false, 
+      error: true, 
+      reason: `API or execution error: ${error.message}` 
+    }; 
+  }
 }

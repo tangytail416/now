@@ -45,11 +45,13 @@ export async function executeSplunkQueries(
         let earliestTime = '-1h';
         let latestTime = 'now';
 
-        // First, check if time_range is explicitly set (e.g., from threat hunt)
-        if (context.alertData?.time_range) {
-          earliestTime = context.alertData.time_range.earliest || '-1h';
-          latestTime = context.alertData.time_range.latest || 'now';
-          console.log('[Executor] Using time range from alert data (threat hunt)');
+        // First, check if this is a threat hunt or explicitly provided time range
+        if (context.alertData?.time_range || context.alertData?.is_threat_hunt) {
+          // Open the API window completely so the SPL string's internal earliest/latest can dictate the bounds.
+          // This prevents REST API crashes from unsupported date formats while fully respecting the agent's query.
+          earliestTime = '0';
+          latestTime = 'now';
+          console.log('[Executor] Using broad API time window (0 to now) to defer to SPL internal time bounds');
         }
         // Otherwise, create time window around alert timestamp
         else if (context.alertData?.timestamp) {

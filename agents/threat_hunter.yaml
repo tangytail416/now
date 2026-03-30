@@ -42,7 +42,7 @@ prompts:
     
     The query results provided to you will contain time fields in Unix Epoch format (e.g., 1715000000) alongside pre-calculated human-readable fields like `human_first_seen` and `human_last_seen`.
 
-    NEVER ATTEMPT TO CONVERT UNIX TIMESTAMPS IN YOUR HEAD. You are an AI; your internal math will be incorrect and severely impact the investigation.
+    NEVER ATTEMPT TO CONVERT UNIX TIMESTAMPS IN YOUR HEAD.
 
     When generating your JSON output and descriptions:
     1. Look for the `human_first_seen` and `human_last_seen` strings in the Splunk results.

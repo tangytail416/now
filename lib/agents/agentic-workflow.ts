@@ -11,6 +11,7 @@
 
 import { prisma } from '@/lib/db';
 import { createAIClient } from '@/lib/ai';
+import { generateJudgeChallenge } from './judge-evaluator';
 import { createSplunkClientFromDB } from '@/lib/splunk/client';
 import { loadAgentConfig } from './config-loader';
 import { getActiveWhitelistedIOCs, getWhitelistAsJSON, filterWhitelistedFromSplunkResults } from './whitelist-helper';
@@ -456,6 +457,7 @@ async function executeSpecialistAgent(
     let agentIteration = 0;
     const maxAgentIterations = 20; // Reduced from 50 to prevent excessive loops
     const agentFindings: any[] = [];
+    let judgeHasChallenged = false;
 
     while (!agentComplete && agentIteration < maxAgentIterations) {
       agentIteration++;
@@ -971,7 +973,7 @@ async function executeSpecialistAgent(
                 .filter(f => f.action === 'query' && !f.skipped && f.results?.length === 0);
 
               if (recentEmptyQueries.length >= 3) {
-                console.warn(`[Agent: ${agentName}] ⚠️  Three consecutive queries returned no results`);
+                console.warn(`[Agent: ${agentName}] Three!!!! consecutive queries returned no results`);
 
                 // Count total empty queries
                 const allEmptyQueries = agentFindings
@@ -1028,9 +1030,88 @@ async function executeSpecialistAgent(
         }
       }
 
-      // Check if agent is satisfied and has findings to report
-      if (agentDecision.action === 'report' || agentDecision.complete) {
+	if (agentDecision.action === 'report' || agentDecision.complete) {
+        
+        // --- NEW: THE JUDGE INTERCEPTION (ONE-AND-DONE) ---
+        // Exclude the compilation agents from the Judge since their data is already verified!
+        const isCompilingAgent = agentName === 'report_generator' || agentName === 'case_correlation';
+        
+        if (!isCompilingAgent && !judgeHasChallenged) {
+          console.log(`[Agent: ${agentName}] Agent wants to complete. Summoning the Judge...`);
+          const judgeChallenge = await generateJudgeChallenge(
+             aiProvider, 
+             config.modelUsed || 'glm-5', 
+             agentName, 
+             agentDecision.analysis
+          );
+
+          if (judgeChallenge) {
+              console.log(`[Judge] ⚖️ Challenge Issued: Forcing ${agentName} to verify findings.`);
+              judgeHasChallenged = true; // Mark that the judge has spoken
+              
+              // Inject the Judge's challenge into the context
+              agentFindings.push({
+                 iteration: agentIteration,
+                 action: 'judge_challenge',
+                 system_directive: `⚖️ THE REVIEWER HAS A CONFIRMATION REQUEST:\n\n"${judgeChallenge}"\n\nIf you ALREADY have the raw logs in your previous iterations to prove this, output action="report" and quote them. If not, output action="query" to confirm they are real. If you realize your claim was incorrect, revise your findings and output action="report".`,
+              });
+              // Force the loop to continue
+              agentComplete = false;
+              continue; 
+          }
+          console.log(`[Judge] ⚖️ Findings Approved.`);
+          judgeHasChallenged = true; // Mark as approved so it doesn't run again
+        }
+        // -----------------------------------
+        
         agentComplete = true;
+
+        if (agentDecision.new_alerts && Array.isArray(agentDecision.new_alerts) && agentDecision.new_alerts.length > 0) {
+          console.log(`[Agent: ${agentName}] 🚨 Agent discovered ${agentDecision.new_alerts.length} parallel threats. Generating new alerts...`);
+          
+          for (const alertDef of agentDecision.new_alerts) {
+            try {
+              const newAlert = await prisma.alert.create({
+                data: {
+                  title: alertDef.title || 'Agent-Generated Alert',
+                  severity: alertDef.severity || 'medium',
+                  description: `${alertDef.description || 'Discovered during autonomous investigation.'}\n\nSpawned by agent: ${agentName}\nParent Investigation: ${state.investigation_id}`,
+                  source: `Sherlock Agent: ${agentName}`,
+                  rawData: alertDef.raw_data || { parent_investigation: state.investigation_id },
+                  status: 'new',
+                }
+              });
+
+              console.log(`  -> Created Alert: ${newAlert.id} (${newAlert.title})`);
+
+              // Add a record of this to the agent's findings so it appears in the final report
+              agentFindings.push({
+                iteration: agentIteration,
+                action: 'spawned_alert',
+                alert_id: newAlert.id,
+                alert_title: newAlert.title,
+                note: `Agent autonomously spawned a new alert for a parallel threat discovered during this investigation.`
+              });
+
+              // Optional: Emit a socket event so the UI can pop a toast notification!
+              emitAgentEvent({
+                investigationId: state.investigation_id,
+                agentName,
+                phase: 'alert_generated',
+                data: { 
+                  alertId: newAlert.id, 
+                  title: newAlert.title, 
+                  severity: newAlert.severity,
+                  message: `New parallel threat detected and alert generated!`
+                },
+                timestamp: new Date(),
+              });
+
+            } catch (e) {
+              console.error(`[Agent: ${agentName}] Failed to spawn alert:`, e);
+            }
+          }
+        }
         agentFindings.push({
           iteration: agentIteration,
           action: 'report',
@@ -1312,7 +1393,7 @@ CRITICAL INSTRUCTIONS:
   console.log(`[Orchestrator] Current context size: ${contextTokens.toLocaleString()} tokens`);
 
   // If context exceeds threshold, we're in a critical state
-  const CRITICAL_THRESHOLD = 140000;
+  const CRITICAL_THRESHOLD = 150000;
   if (contextTokens > CRITICAL_THRESHOLD) {
     console.log(`[Orchestrator] ⚠️  Context size exceeds critical threshold (${CRITICAL_THRESHOLD.toLocaleString()} tokens)`);
     console.log(`[Orchestrator] Forcing investigation completion to prevent token overflow`);
@@ -1508,11 +1589,14 @@ You can autonomously investigate by:
 2. Requesting Splunk queries (return action: "query" with SPL)
 3. Drawing conclusions
 4. Reporting findings when satisfied (return action: "report")
+5. If you discover a distinct, new threat during your investigation that is OUTSIDE the scope of the original alert but warrants its own separate investigation, you can spawn a new alert.
 
 IMPORTANT: You MUST take action on every iteration:
 - If you need more data → return action: "query" with a NEW Splunk query (different from previous queries)
 - If a query returns no results → try a different approach, time range, or index
 - If multiple queries return no results → report findings explaining what you searched and why no evidence was found
+- If multiple queries return no results → STOP querying and report findings based ONLY on your successful queries. 
+- CRITICAL: NEVER claim "no evidence was found" if you successfully found malicious activity in earlier iterations. Only report "no evidence" if ALL of your queries returned 0 results.
 - If you have sufficient findings → return action: "report" with your analysis
 - DO NOT return action: "continue" - always either query for data or report findings
 - DO NOT repeat the same query - it will return the same results and waste time
@@ -1527,6 +1611,8 @@ SPLUNK QUERY RULES:
   * index=cloudtrail eventName="CreateAccessKey" | table _time, userIdentity.userName, sourceIPAddress
   * index=vpcflow action=REJECT | stats count by src_ip, dest_port
   * index=cloudwatch error OR exception | head 50
+- Splunk returns _time in Unix Epoch format (e.g., 1763140502). Do not be alarmed if the raw results use Epoch time while your query uses human-readable time.
+- AVOID THE 'IN()' OPERATOR: Do not use 'search field IN ("val1", "val2")' as LLMs frequently add spaces that break Splunk's exact-match parser. Instead, explicitly use OR statements: '(field="val1" OR field="val2")'.
 
 OUTPUT FORMAT (JSON):
 {
@@ -1535,6 +1621,14 @@ OUTPUT FORMAT (JSON):
   "query": "SPL query WITHOUT 'search' prefix (REQUIRED if action=query)",
   "finding": "What you discovered from previous queries",
   "analysis": "Full analysis (REQUIRED if action=report)",
+  "new_alerts": [
+    {
+      "title": "Short title of the newly discovered threat",
+      "severity": "critical" | "high" | "medium" | "low",
+      "description": "Why this needs a separate alert",
+      "raw_data": {"relevant_ips": [], "notes": ""}
+    }
+  ],
   "confidence": 0.0-1.0,
   "complete": true if satisfied
 }

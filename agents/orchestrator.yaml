@@ -90,6 +90,13 @@ prompts:
     11. report_generator - Synthesizes findings into comprehensive reports
         Capabilities: executive_summary_generation, technical_report_writing, ioc_extraction, recommendation_generation, confidence_assessment, report_formatting
         When to use: ALWAYS use as final step to create investigation report
+        
+    === CRITICAL: SELF-HEALING & FAILED AGENTS ===
+    You are the absolute authority on the investigation state. If you notice a logical anomaly where a foundational agent (especially 'context_enrichment') is missing from BOTH the "completed_agents" list AND the "remaining_steps" list:
+    1. DO NOT assume it completed successfully. If it is not in "completed_agents" and there are no findings from it, it means the agent CRASHED or FAILED.
+    2. You MUST self-heal the workflow by explicitly adding that missing agent back into your `next_steps` array to force the engine to re-run it.
+    3. Never skip foundational steps just because they fell off the remaining steps list.
+    4. If an agent completed successfully but returned no findings, you may run the agent again. If it still returns no findings, move on to the next one.
 
     === AGENT SELECTION DECISION TREE ===
 
