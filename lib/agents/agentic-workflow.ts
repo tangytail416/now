@@ -384,10 +384,18 @@ OUTPUT FORMAT (JSON):
     }
   }
 
-  const plan = parseJSON(response.content);
+const plan = parseJSON(response.content);
 
-// Update state - ensure it's an array to prevent crashes
-  state.next_steps = Array.isArray(plan.next_steps) ? plan.next_steps : [];
+  // Update state - ensure it's an array to prevent crashes
+  let plannedSteps = Array.isArray(plan.next_steps) ? plan.next_steps : [];
+  
+  // Guarantee report_generator is absolute last in the queue
+  if (plannedSteps.includes('report_generator')) {
+    plannedSteps = plannedSteps.filter((s: string) => s !== 'report_generator');
+    plannedSteps.push('report_generator');
+  }
+  
+  state.next_steps = plannedSteps;
   state.current_phase = 'investigation';
   
   // Use state.next_steps (which is guaranteed to be an array) and fallback for reasoning
@@ -776,6 +784,10 @@ async function executeSpecialistAgent(
       }
 
       const agentDecision = parseJSON(response.content);
+	  if ((agentName.includes('correlation') || agentName === 'report_generator') && !agentDecision.action) {
+        agentDecision.action = 'report';
+        agentDecision.complete = true;
+      }
 
       // Safety check: if agent returns "continue" without a query, force it to report
       if (agentDecision.action === 'continue') {
@@ -982,22 +994,46 @@ async function executeSpecialistAgent(
                 console.log(`[Agent: ${agentName}] Empty result count: ${allEmptyQueries.length} total, ${recentEmptyQueries.length} recent`);
 
                 // After 5 empty results, force completion
+                // After 5 empty results, force completion
                 if (allEmptyQueries.length >= 5) {
                   console.log(`[Agent: ${agentName}] Forcing completion after ${allEmptyQueries.length} empty results`);
-                  console.log(`[Agent: ${agentName}] Agent should report findings or conclude no evidence was found`);
+                  
+                  // Check if the agent actually found things in earlier queries
+                  const successfulQueries = agentFindings.filter(
+                    f => f.action === 'query' && !f.skipped && f.results && f.results.length > 0
+                  );
 
                   agentComplete = true;
-                  agentFindings.push({
-                    iteration: agentIteration + 1,
-                    action: 'report',
-                    analysis: {
-                      status: 'completed',
-                      note: 'Investigation completed after multiple queries returned no results.',
-                      queries_executed: agentFindings.filter(f => f.action === 'query' && !f.skipped).length,
-                      empty_results: allEmptyQueries.length,
-                      conclusion: 'No evidence found in the queried data sources. This could indicate either no malicious activity occurred, or the activity is not logged in the available data.',
-                    },
-                  });
+                  
+                  if (successfulQueries.length > 0) {
+                    // Scenario A: It found evidence early on, but got stuck later
+                    console.log(`[Agent: ${agentName}] Agent found evidence in ${successfulQueries.length} previous queries before getting stuck.`);
+                    agentFindings.push({
+                      iteration: agentIteration + 1,
+                      action: 'report',
+                      analysis: {
+                        status: 'completed_with_findings',
+                        note: 'Agent was forcefully completed after recent queries failed, but evidence was successfully gathered in earlier iterations.',
+                        queries_executed: agentFindings.filter(f => f.action === 'query' && !f.skipped).length,
+                        successful_queries: successfulQueries.length,
+                        conclusion: 'The investigation was halted because recent searches returned no results. However, actionable evidence was discovered in previous queries. Review the successful queries above.',
+                      },
+                    });
+                  } else {
+                    // Scenario B: It found absolutely nothing the entire time
+                    console.log(`[Agent: ${agentName}] Agent found absolutely zero evidence.`);
+                    agentFindings.push({
+                      iteration: agentIteration + 1,
+                      action: 'report',
+                      analysis: {
+                        status: 'completed_empty',
+                        note: 'Investigation completed after multiple queries returned no results.',
+                        queries_executed: agentFindings.filter(f => f.action === 'query' && !f.skipped).length,
+                        empty_results: allEmptyQueries.length,
+                        conclusion: 'No evidence found in the queried data sources. This could indicate either no malicious activity occurred, or the activity is not logged in the available data.',
+                      },
+                    });
+                  }
                   break;
                 }
               }
@@ -1117,6 +1153,8 @@ async function executeSpecialistAgent(
           action: 'report',
           analysis: agentDecision.analysis || agentDecision,
           confidence: agentDecision.confidence,
+		  notable_entities: agentDecision.notable_entities || [],
+          notable_relationships: agentDecision.notable_relationships || []
         });
 
         // Emit output event
@@ -1190,27 +1228,40 @@ async function executeSpecialistAgent(
         const { NodeLabel } = await import('@/lib/neo4j/schema');
         const findingText = JSON.stringify(finalReport.summary);
 
-        // Helper function to recursively search for a field in any JSON object
+
         const findFieldInObject = (obj: any, fieldName: string): any => {
           if (!obj || typeof obj !== 'object') return null;
+          
+          let emptyFallback = null;
+
           if (Array.isArray(obj)) {
-            // If it's an array, search each element
             for (const item of obj) {
               const result = findFieldInObject(item, fieldName);
-              if (result) return result;
+              // If we found a populated array, jackpot! Return it immediately.
+              if (result && Array.isArray(result) && result.length > 0) return result;
+              // If it's empty, remember it but keep looking
+              if (result) emptyFallback = result;
             }
-            return null;
+            return emptyFallback;
           }
+
           // Check if this object has the field
-          if (obj[fieldName] !== undefined) return obj[fieldName];
+          if (obj[fieldName] !== undefined) {
+            const val = obj[fieldName];
+            if (Array.isArray(val) && val.length > 0) return val; 
+            emptyFallback = val;
+          }
+
           // Recursively search nested objects
           for (const key in obj) {
             if (obj.hasOwnProperty(key)) {
               const result = findFieldInObject(obj[key], fieldName);
-              if (result) return result;
+              if (result && Array.isArray(result) && result.length > 0) return result;
+              if (result) emptyFallback = result;
             }
           }
-          return null;
+
+          return emptyFallback;
         };
 
         // Extract entities and relationships from anywhere in the agent's response
@@ -1253,16 +1304,34 @@ async function executeSpecialistAgent(
         }
 
         // Extract MITRE ATT&CK techniques from findings if present
-        const mitreIds: string[] = [];
+        const rawMitreData: any[] = [];
         if (finalReport.summary?.mitre_attack) {
-          mitreIds.push(finalReport.summary.mitre_attack);
+          rawMitreData.push(finalReport.summary.mitre_attack);
         }
         if (finalReport.summary?.techniques) {
-          mitreIds.push(...finalReport.summary.techniques);
+          // Handle both single objects and arrays of objects/strings
+          if (Array.isArray(finalReport.summary.techniques)) {
+            rawMitreData.push(...finalReport.summary.techniques);
+          } else {
+            rawMitreData.push(finalReport.summary.techniques);
+          }
         }
-        mitreIds.forEach((id: string) =>
-          agentEntities.push({ type: NodeLabel.Technique, value: id })
-        );
+        
+        // Safely extract the string value, even if the LLM returned a nested object
+        rawMitreData.forEach((item: any) => {
+          let techniqueStr = '';
+          
+          if (typeof item === 'string') {
+            techniqueStr = item;
+          } else if (typeof item === 'object' && item !== null) {
+            // Pluck the ID from common object keys LLMs use
+            techniqueStr = item.techniqueID || item.id || item.technique_id || item.name || item.technique || '';
+          }
+
+          if (techniqueStr && typeof techniqueStr === 'string' && techniqueStr.trim() !== '') {
+            agentEntities.push({ type: NodeLabel.Technique, value: techniqueStr.trim() });
+          }
+        });
 
         await addFindingToGraph(
           execution.id, // findingId
@@ -1393,6 +1462,7 @@ CRITICAL INSTRUCTIONS:
   console.log(`[Orchestrator] Current context size: ${contextTokens.toLocaleString()} tokens`);
 
   // If context exceeds threshold, we're in a critical state
+// If context exceeds threshold, we're in a critical state
   const CRITICAL_THRESHOLD = 150000;
   if (contextTokens > CRITICAL_THRESHOLD) {
     console.log(`[Orchestrator] ⚠️  Context size exceeds critical threshold (${CRITICAL_THRESHOLD.toLocaleString()} tokens)`);
@@ -1411,20 +1481,39 @@ CRITICAL INSTRUCTIONS:
     return;
   }
 
-const findingsArray = Array.isArray(state.findings) 
-  ? state.findings 
-  : Object.values(state.findings);
+  // --- NEW: FETCH FAILED AGENTS ---
+  const failedExecutions = await prisma.agentExecution.findMany({
+    where: { 
+      investigationId: state.investigation_id,
+      status: 'failed'
+    },
+    orderBy: { createdAt: 'desc' }
+  });
+  
+  const failedAgentNames = [...new Set(failedExecutions.map(e => e.agentName))];
+  const unresolvedFailures = failedAgentNames.filter(name => !state.completed_agents.includes(name));
+  
+  let failureWarning = '';
+  if (unresolvedFailures.length > 0) {
+    failureWarning = `\n\n🚨 CRITICAL SYSTEM WARNING: The following agents FAILED during execution and have not successfully completed: ${unresolvedFailures.join(', ')}.\nYou MUST re-add these agents to 'next_steps' to retry them. DO NOT set "complete": true or schedule 'report_generator' until these failures are successfully resolved.`;
+  }
+  // ---------------------------------
 
-const summarizedFindings = findingsArray.map((f: any) => ({
-  agent: f.agent,                    // was f.agentName
-  iterations: f.iterations,
-  total_queries: f.total_queries,
-  key_findings: f.key_findings || [],  // top level, no f.result wrapper
-  summary: f.key_findings || 'No summary available',
-}));
+  const findingsArray = Array.isArray(state.findings) 
+    ? state.findings 
+    : Object.values(state.findings);
 
-const reflectionPrompt = `
-You are the Orchestrator reviewing investigation progress.${whitelistSection}${userGuidanceSection}
+  const summarizedFindings = findingsArray.map((f: any) => ({
+    agent: f.agent,                    
+    iterations: f.iterations,
+    total_queries: f.total_queries,
+    key_findings: f.key_findings || [],  
+    summary: f.key_findings || 'No summary available',
+  }));
+
+  // 👇 FIX 1: failureWarning added to the end of this line 👇
+  const reflectionPrompt = `
+You are the Orchestrator reviewing investigation progress.${whitelistSection}${userGuidanceSection}${failureWarning}
 
 COMPLETED AGENTS: ${state.completed_agents.join(', ')}
 
@@ -1461,25 +1550,51 @@ OUTPUT FORMAT (JSON):
 
   const reflection = parseJSON(response.content);
 
-  // Update state based on orchestrator's reflection
-  if (reflection.complete) {
+  // --- NEW: FORCED ARRAY OVERRIDE ---
+  if (reflection.complete && unresolvedFailures.length === 0) {
     state.current_phase = 'synthesis';
     state.next_steps = [];
-  } else if (reflection.next_steps) {
-    state.next_steps = reflection.next_steps;
+  } else {
+    let nextSteps = Array.isArray(reflection.next_steps) ? reflection.next_steps : [];
+    
+    // Safety net: force unresolved failures back to the front if LLM ignored the warning
+    for (const failedAgent of unresolvedFailures) {
+      if (!nextSteps.includes(failedAgent)) {
+         nextSteps.unshift(failedAgent);
+         console.log(`[Orchestrator] Auto-injected failed agent ${failedAgent} into next_steps`);
+      }
+    }
+
+    // Guarantee report_generator is absolute last
+    if (nextSteps.includes('report_generator')) {
+      nextSteps = nextSteps.filter((s: string) => s !== 'report_generator');
+      nextSteps.push('report_generator');
+    }
+
+    state.next_steps = nextSteps;
+    
+    // If the LLM said complete: true but we had failures, override it
+    if (reflection.complete) {
+       console.log(`[Orchestrator] Overriding complete=true because of unresolved failures.`);
+       reflection.complete = false;
+    }
   }
 
+  // 👇 FIX 2: Added the history save back in 👇
   state.conversation_history.push({
     role: 'orchestrator',
-    content: `Reflection: ${reflection.assessment}. ${reflection.complete ? 'Investigation complete.' : `Next: ${reflection.next_steps?.join(', ')}`}`,
+    content: `[ORCHESTRATOR ASSESSMENT]: ${reflection.assessment}\n[CRITICAL DIRECTIVE/REASONING]: ${reflection.reasoning}\n${reflection.complete && unresolvedFailures.length === 0 ? 'Investigation complete.' : `Next: ${state.next_steps?.join(', ')}`}`,
     timestamp: new Date(),
     action: 'plan',
     metadata: reflection,
   });
 
-  console.log(`[Orchestrator] ${reflection.complete ? 'Investigation complete' : `Next steps: ${reflection.next_steps?.join(', ')}`}`);
+  console.log(`[Orchestrator] ${reflection.complete && unresolvedFailures.length === 0 ? 'Investigation complete' : `Next steps: ${state.next_steps?.join(', ')}`}`);
 }
 
+/**
+ * Build agent prompt with full context
+ */
 /**
  * Build agent prompt with full context
  */
@@ -1493,7 +1608,7 @@ async function buildAgentPrompt(config: AgentConfig, state: AgenticState, findin
 
   const splunkReference = `\n\n=== SPLUNK INDEXES & SOURCETYPES AVAILABLE ===\n\nIndexes:\n- cloudtrail: AWS API activity, security auditing\n- vpcflow: Network traffic analysis, flow logs\n- linux: Linux security, Sysmon, auth logs\n- windows: Windows events, security logs\n- cloudwatch: ECS logs, Lambda, Bedrock AI\n- aws-metadata: EC2 metadata, resource inventory\n- loadbalancer: ELB access logs, web traffic\n- waf: AWS WAF logs\n- amazonq: Amazon Q invocation logs\n\nKey Source Types:\n- aws:cloudtrail (cloudtrail index): IAM activity, API calls\n- aws:cloudwatchlogs:vpcflow (vpcflow index): Network traffic\n- aws:cloudwatchlogs:ecs (cloudwatch index): Container logs\n- sysmon:linux (linux index): Process creation, network connections\n- linux_auth (linux index): SSH logins, sudo commands\n- XmlWinEventLog (windows index): Windows security events\n\nIMPORTANT FIELD EXTRACTION NOTES:\n- Most sourcetypes have PRE-EXTRACTED FIELDS that are immediately available\n- Use the DISCOVERED INDEX STRUCTURE section below for exact field names per sourcetype\n\nExample Queries (ALWAYS include earliest= and latest=):\n- index=cloudtrail eventName=ConsoleLogin earliest=-24h latest=now | table _time, userIdentity.userName, sourceIPAddress\n- index=vpcflow action=REJECT earliest=-7d latest=now | stats count by srcaddr, dstport\n- index=linux sourcetype=sysmon:linux EventID=1 earliest=-1h latest=now | table _time, Image, CommandLine\n- index=windows EventCode=4625 earliest=-24h latest=now | stats count by Account_Name\n\nCRITICAL SPLUNK TIME FORMAT RULES:\n1. ALWAYS use earliest= and latest= in ALL queries\n2. Relative time (PREFERRED): earliest=-24h, earliest=-7d, earliest=-30m, latest=now\n3. Snap to time: earliest=-24h@h (snap to hour), earliest=-d@d (snap to day start)\n4. Absolute time format: earliest="11/01/2025:00:00:00" latest="11/30/2025:23:59:59"\n   - Format MUST be: MM/DD/YYYY:HH:MM:SS (American format with colons)\n5. Epoch time: earliest=1698796800 latest=1701388799\n6. NEVER use ISO 8601 format (2025-11-01T00:00:00) - THIS IS INVALID\n\nExamples:\n- Last 24 hours: earliest=-24h latest=now\n- Last 7 days: earliest=-7d latest=now\n- Yesterday: earliest=-d@d latest=@d\n- Specific dates: earliest="11/01/2025:00:00:00" latest="11/30/2025:23:59:59"\n- This month: earliest=-mon@mon latest=now\n`;
 
-  // Fetch dynamic index structure from database (same as executor.ts)
+  // Fetch dynamic index structure from database
   let discoveredStructure = '';
   try {
     const splunkConfig = await prisma.splunkConfig.findFirst({
@@ -1535,14 +1650,52 @@ async function buildAgentPrompt(config: AgentConfig, state: AgenticState, findin
     // Continue without dynamic structure
   }
 
+  // --- NEW: EXTRACT LATEST ORCHESTRATOR COMMAND ---
+  const lastOrchMsg = state.conversation_history.filter(m => m.role === 'orchestrator').pop();
+  const orchestratorDirective = lastOrchMsg ? `\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🚨 SUPERVISOR DIRECTIVE 🚨\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nThe Orchestrator has explicitly summoned you with the following assessment and instructions. You MUST follow these instructions:\n\n${lastOrchMsg.content}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` : '';
+  // -----------------------------------------------
+
+  // --- SHIELD CORRELATION AGENTS FROM SPLUNK RULES ---
+  const isCorrelationAgent = config.name.includes('correlation');
+
+  if (isCorrelationAgent) {
+    return `
+You are the autonomous ${config.name} agent.
+
+ALERT:
+${JSON.stringify(state.alert_data, null, 2)}${whitelistSection}${orchestratorDirective}
+
+CONTEXT FROM OTHER AGENTS (THIS IS YOUR RAW MATERIAL):
+${Object.entries(state.findings)
+  .filter(([agent]) => agent !== config.name)
+  .map(([agent, data]) => `${agent}: ${JSON.stringify(data)}`).join('\n\n')}
+
+YOUR CAPABILITIES:
+${config.capabilities.join(', ')}
+
+INSTRUCTIONS:
+Analyze the context provided by the specialist agents above.
+Your specific output formatting instructions, tasks, and JSON schema are defined in your system prompt. 
+You MUST output valid JSON exactly matching the complex schema requested in your system prompt. Ensure your JSON is perfectly formatted with all required commas and brackets.
+
+CRITICAL WORKFLOW REQUIREMENT:
+To successfully submit your findings to the system, you MUST inject these two exact fields into the root of your JSON response alongside your standard schema:
+"action": "report",
+"complete": true
+`;
+  }
+  // ---------------------------------------------------------
+
   return `
 You are an autonomous ${config.name} agent. Your job is to investigate this security alert thoroughly.
 
 ALERT:
-${JSON.stringify(state.alert_data, null, 2)}${whitelistSection}${splunkReference}${discoveredStructure}
+${JSON.stringify(state.alert_data, null, 2)}${whitelistSection}${splunkReference}${discoveredStructure}${orchestratorDirective}
 
 CONTEXT FROM OTHER AGENTS:
-${Object.entries(state.findings).map(([agent, data]) => `${agent}: ${JSON.stringify(data).substring(0, 300)}...`).join('\n')}
+${Object.entries(state.findings)
+  .filter(([agent]) => agent !== config.name) // DO NOT FEED THE AGENT ITS OWN PAST MISTAKES!
+  .map(([agent, data]) => `${agent}: ${JSON.stringify(data).substring(0, 300)}...`).join('\n')}
 
 YOUR PREVIOUS FINDINGS:
 ${JSON.stringify(findings, null, 2)}
@@ -1621,6 +1774,21 @@ OUTPUT FORMAT (JSON):
   "query": "SPL query WITHOUT 'search' prefix (REQUIRED if action=query)",
   "finding": "What you discovered from previous queries",
   "analysis": "Full analysis (REQUIRED if action=report)",
+  "notable_entities": [
+    {
+      "type": "User|Host|IPAddress|File|Process",
+      "value": "The actual IP, username, filename, etc.",
+      "significance": "Why this entity is important"
+    }
+  ],
+  "notable_relationships": [
+    {
+      "source": {"type": "User", "value": "admin"},
+      "target": {"type": "IPAddress", "value": "10.0.0.1"},
+      "relationship": "AUTHENTICATED_FROM | EXECUTED_COMMAND | CONNECTED_TO",
+      "significance": "What this connection means"
+    }
+  ],
   "new_alerts": [
     {
       "title": "Short title of the newly discovered threat",

@@ -96,7 +96,8 @@ prompts:
     1. DO NOT assume it completed successfully. If it is not in "completed_agents" and there are no findings from it, it means the agent CRASHED or FAILED.
     2. You MUST self-heal the workflow by explicitly adding that missing agent back into your `next_steps` array to force the engine to re-run it.
     3. Never skip foundational steps just because they fell off the remaining steps list.
-    4. If an agent completed successfully but returned no findings, you may run the agent again. If it still returns no findings, move on to the next one.
+    4. NEVER schedule 'report_generator' or 'case_correlation' if there are ANY other agents that have yet to be run or re-run. You MUST ensure all specialist agents succeed before moving to reporting. If you add a failed agent back to next_steps, push 'report_generator' to the absolute end of the array.
+    5. If an agent completed successfully but returned no findings, you may run the agent again. If it still returns no findings, move on to the next one.
 
     === AGENT SELECTION DECISION TREE ===
 

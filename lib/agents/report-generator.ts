@@ -299,7 +299,7 @@ Return ONLY the JSON object, no additional text.
         sections: sections,
         severity: severity,
       },
-      summary: sections.executive_summary?.replace(/<[^>]*>/g, '').substring(0, 1500) || 'Report generated successfully',
+      summary: sections.executive_summary?.replace(/<[^>]*>/g, '').substring(0, 4000) || 'Report generated successfully',
       recommendations: JSON.stringify(sections.recommendations || []),
     },
   });
